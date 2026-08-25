@@ -27,6 +27,7 @@
 #include <freertos/task.h>
 #include <lvgl.h>
 #include <array>
+#include <cstdio>
 #include <string>
 
 #define TAG "WaveshareEsp32c6TouchAMOLED2inch16"
@@ -120,7 +121,40 @@ private:
         if (strcmp(state->valuestring, "off") == 0) {
             return "关";
         }
+        if (strcmp(state->valuestring, "cool") == 0) {
+            return "制冷";
+        }
+        if (strcmp(state->valuestring, "heat") == 0) {
+            return "制热";
+        }
+        if (strcmp(state->valuestring, "dry") == 0) {
+            return "除湿";
+        }
+        if (strcmp(state->valuestring, "fan_only") == 0) {
+            return "送风";
+        }
+        if (strcmp(state->valuestring, "auto") == 0) {
+            return "自动";
+        }
+        if (strcmp(state->valuestring, "idle") == 0) {
+            return "待机";
+        }
         return state->valuestring;
+    }
+
+    static const char* FanText(const char* value) {
+        if (strcmp(value, "low") == 0) return "低风";
+        if (strcmp(value, "medium") == 0 || strcmp(value, "mid") == 0) return "中风";
+        if (strcmp(value, "high") == 0) return "高风";
+        if (strcmp(value, "auto") == 0) return "自动风";
+        if (strcmp(value, "quiet") == 0 || strcmp(value, "silent") == 0) return "静音";
+        return value;
+    }
+
+    static bool IsAvailable(const cJSON* item) {
+        auto state = cJSON_GetObjectItemCaseSensitive(item, "state");
+        return cJSON_IsString(state) && strcmp(state->valuestring, "unavailable") != 0 &&
+               strcmp(state->valuestring, "unknown") != 0;
     }
 
     static void AppendRole(std::string& text, const cJSON* room, const char* role,
@@ -132,10 +166,46 @@ private:
         text += "\n";
         text += title;
         text += StateText(item);
-        auto state = cJSON_GetObjectItemCaseSensitive(item, "state");
-        if (cJSON_IsString(state) && strcmp(state->valuestring, "unavailable") != 0 &&
-            strcmp(state->valuestring, "unknown") != 0) {
+        if (IsAvailable(item)) {
             text += suffix;
+        }
+    }
+
+    static void AppendLight(std::string& text, const cJSON* room) {
+        auto item = cJSON_GetObjectItemCaseSensitive(room, "light");
+        if (!cJSON_IsObject(item)) return;
+        text += "\n灯光  ";
+        text += StateText(item);
+        auto brightness = cJSON_GetObjectItemCaseSensitive(item, "brightness_pct");
+        if (IsAvailable(item) && cJSON_IsNumber(brightness) &&
+            strcmp(StateText(item), "关") != 0) {
+            char value[12];
+            snprintf(value, sizeof(value), " %d%%", brightness->valueint);
+            text += value;
+        }
+    }
+
+    static void AppendClimate(std::string& text, const cJSON* room) {
+        auto item = cJSON_GetObjectItemCaseSensitive(room, "climate");
+        if (!cJSON_IsObject(item)) return;
+        text += "\n空调  ";
+        text += StateText(item);
+        if (!IsAvailable(item) || strcmp(StateText(item), "关") == 0) return;
+
+        auto temperature = cJSON_GetObjectItemCaseSensitive(item, "temperature");
+        if (cJSON_IsNumber(temperature)) {
+            char value[16];
+            snprintf(value, sizeof(value), " %.0f°C", temperature->valuedouble);
+            text += value;
+        }
+        auto fan = cJSON_GetObjectItemCaseSensitive(item, "fan_mode");
+        if (cJSON_IsString(fan)) {
+            text += " ";
+            text += FanText(fan->valuestring);
+        }
+        auto swing = cJSON_GetObjectItemCaseSensitive(item, "swing_mode");
+        if (cJSON_IsString(swing) && strcmp(swing->valuestring, "off") != 0) {
+            text += " 摆风";
         }
     }
 
@@ -222,8 +292,8 @@ public:
                 if (!cJSON_IsObject(room)) {
                     text += "\n暂无设备";
                 } else {
-                    AppendRole(text, room, "light", "灯光  ");
-                    AppendRole(text, room, "climate", "空调  ");
+                    AppendLight(text, room);
+                    AppendClimate(text, room);
                     AppendRole(text, room, "temperature", "温度  ", "°C");
                     AppendRole(text, room, "humidity", "湿度  ", "%");
                 }
