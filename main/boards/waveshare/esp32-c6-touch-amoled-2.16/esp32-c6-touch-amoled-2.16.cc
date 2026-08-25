@@ -22,7 +22,12 @@
 
 #include <esp_lcd_touch_cst9217.h>
 #include <esp_lvgl_port.h>
+#include <cJSON.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <lvgl.h>
+#include <array>
+#include <string>
 
 #define TAG "WaveshareEsp32c6TouchAMOLED2inch16"
 
@@ -96,6 +101,77 @@ static const sh8601_lcd_init_cmd_t vendor_specific_init[] = {
 
 // 在waveshare_amoled_2_16类之前添加新的显示类
 class CustomLcdDisplay : public SpiLcdDisplay {
+private:
+    lv_obj_t* dashboard_ = nullptr;
+    std::array<lv_obj_t*, 4> room_labels_{};
+
+    static const char* StateText(const cJSON* item) {
+        auto state = cJSON_GetObjectItemCaseSensitive(item, "state");
+        if (!cJSON_IsString(state)) {
+            return "--";
+        }
+        if (strcmp(state->valuestring, "unavailable") == 0 ||
+            strcmp(state->valuestring, "unknown") == 0) {
+            return "离线";
+        }
+        if (strcmp(state->valuestring, "on") == 0) {
+            return "开";
+        }
+        if (strcmp(state->valuestring, "off") == 0) {
+            return "关";
+        }
+        return state->valuestring;
+    }
+
+    static void AppendRole(std::string& text, const cJSON* room, const char* role,
+                           const char* title, const char* suffix = "") {
+        auto item = cJSON_GetObjectItemCaseSensitive(room, role);
+        if (!cJSON_IsObject(item)) {
+            return;
+        }
+        text += "\n";
+        text += title;
+        text += StateText(item);
+        auto state = cJSON_GetObjectItemCaseSensitive(item, "state");
+        if (cJSON_IsString(state) && strcmp(state->valuestring, "unavailable") != 0 &&
+            strcmp(state->valuestring, "unknown") != 0) {
+            text += suffix;
+        }
+    }
+
+    void CreateDashboard() {
+        auto screen = lv_screen_active();
+        dashboard_ = lv_obj_create(screen);
+        lv_obj_set_size(dashboard_, 444, 360);
+        lv_obj_align(dashboard_, LV_ALIGN_CENTER, 0, 8);
+        lv_obj_set_style_bg_color(dashboard_, lv_color_hex(0x080D16), 0);
+        lv_obj_set_style_bg_opa(dashboard_, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(dashboard_, 0, 0);
+        lv_obj_set_style_pad_all(dashboard_, 0, 0);
+        lv_obj_set_scrollbar_mode(dashboard_, LV_SCROLLBAR_MODE_OFF);
+
+        constexpr const char* names[] = {"主卧", "次卧", "客厅", "书房"};
+        for (size_t i = 0; i < room_labels_.size(); ++i) {
+            auto card = lv_obj_create(dashboard_);
+            lv_obj_set_size(card, 214, 170);
+            lv_obj_set_pos(card, (i % 2) * 224 + 3, (i / 2) * 180 + 3);
+            lv_obj_set_style_radius(card, 16, 0);
+            lv_obj_set_style_bg_color(card, lv_color_hex(0x152235), 0);
+            lv_obj_set_style_border_color(card, lv_color_hex(0x294461), 0);
+            lv_obj_set_style_border_width(card, 1, 0);
+            lv_obj_set_style_pad_all(card, 14, 0);
+            lv_obj_set_scrollbar_mode(card, LV_SCROLLBAR_MODE_OFF);
+            room_labels_[i] = lv_label_create(card);
+            lv_obj_set_width(room_labels_[i], 186);
+            lv_label_set_long_mode(room_labels_[i], LV_LABEL_LONG_WRAP);
+            lv_obj_set_style_text_color(room_labels_[i], lv_color_hex(0xEAF4FF), 0);
+            lv_label_set_text_fmt(room_labels_[i], "%s\n等待网关…", names[i]);
+        }
+        if (emoji_box_ != nullptr) {
+            lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
 public:
     static void rounder_event_cb(lv_event_t* e) {
         lv_area_t* area = (lv_area_t*)lv_event_get_param(e);
@@ -127,6 +203,34 @@ public:
         lv_obj_set_style_pad_left(top_bar_, 60, 0);
         lv_obj_set_style_pad_right(top_bar_, 60, 0);
         lv_display_add_event_cb(display_, rounder_event_cb, LV_EVENT_INVALIDATE_AREA, NULL);
+        CreateDashboard();
+    }
+
+    void UpdateDashboard(const std::string& payload) {
+        cJSON* root = cJSON_ParseWithLength(payload.data(), payload.size());
+        if (root == nullptr) {
+            ESP_LOGW(TAG, "Invalid HA display JSON");
+            return;
+        }
+        auto rooms = cJSON_GetObjectItemCaseSensitive(root, "rooms");
+        constexpr const char* names[] = {"主卧", "次卧", "客厅", "书房"};
+        DisplayLockGuard lock(this);
+        if (cJSON_IsObject(rooms) && dashboard_ != nullptr) {
+            for (size_t i = 0; i < room_labels_.size(); ++i) {
+                auto room = cJSON_GetObjectItemCaseSensitive(rooms, names[i]);
+                std::string text = names[i];
+                if (!cJSON_IsObject(room)) {
+                    text += "\n暂无设备";
+                } else {
+                    AppendRole(text, room, "light", "灯光  ");
+                    AppendRole(text, room, "climate", "空调  ");
+                    AppendRole(text, room, "temperature", "温度  ", "°C");
+                    AppendRole(text, room, "humidity", "湿度  ", "%");
+                }
+                lv_label_set_text(room_labels_[i], text.c_str());
+            }
+        }
+        cJSON_Delete(root);
     }
 };
 
@@ -157,6 +261,30 @@ private:
     CustomLcdDisplay* display_;
     CustomBacklight* backlight_;
     PowerSaveTimer* power_save_timer_;
+
+    void StartHaDisplayTask() {
+        xTaskCreate(
+            [](void* arg) {
+                auto self = static_cast<WaveshareEsp32c6TouchAMOLED2inch16*>(arg);
+                vTaskDelay(pdMS_TO_TICKS(8000));
+                while (true) {
+                    auto network = self->GetNetwork();
+                    if (network != nullptr) {
+                        auto http = network->CreateHttp(0);
+                        http->SetTimeout(5000);
+                        if (http->Open("GET", HA_DISPLAY_URL) && http->GetStatusCode() == 200) {
+                            auto body = http->ReadAll();
+                            self->display_->UpdateDashboard(body);
+                        } else {
+                            ESP_LOGW(TAG, "HA display gateway unavailable");
+                        }
+                        http->Close();
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(HA_DISPLAY_REFRESH_SECONDS * 1000));
+                }
+            },
+            "ha_display", 6144, this, 2, nullptr);
+    }
 
     void InitializePowerSaveTimer() {
         power_save_timer_ = new PowerSaveTimer(-1, 120, 1200);
@@ -320,6 +448,7 @@ public:
         InitializeTouch();
         InitializeButtons();
         InitializeTools();
+        StartHaDisplayTask();
     }
 
     virtual AudioCodec* GetAudioCodec() override {

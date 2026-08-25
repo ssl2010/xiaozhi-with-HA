@@ -43,4 +43,8 @@
 #define DISPLAY_OFFSET_X  0
 #define DISPLAY_OFFSET_Y  0
 
+// Read-only compact room state endpoint. HA credentials remain on the gateway.
+#define HA_DISPLAY_URL "http://192.168.3.188:8090/api/display"
+#define HA_DISPLAY_REFRESH_SECONDS 10
+
 #endif // _BOARD_CONFIG_H_
