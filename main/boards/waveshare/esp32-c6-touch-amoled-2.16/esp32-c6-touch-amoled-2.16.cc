@@ -336,13 +336,16 @@ private:
         xTaskCreate(
             [](void* arg) {
                 auto self = static_cast<WaveshareEsp32c6TouchAMOLED2inch16*>(arg);
+                Settings settings("wifi", false);
+                auto display_url = settings.GetString("ha_display_url", HA_DISPLAY_URL);
+                ESP_LOGI(TAG, "HA display URL: %s", display_url.c_str());
                 vTaskDelay(pdMS_TO_TICKS(8000));
                 while (true) {
                     auto network = self->GetNetwork();
                     if (network != nullptr) {
                         auto http = network->CreateHttp(0);
                         http->SetTimeout(5000);
-                        if (http->Open("GET", HA_DISPLAY_URL) && http->GetStatusCode() == 200) {
+                        if (http->Open("GET", display_url) && http->GetStatusCode() == 200) {
                             auto body = http->ReadAll();
                             self->display_->UpdateDashboard(body);
                         } else {
