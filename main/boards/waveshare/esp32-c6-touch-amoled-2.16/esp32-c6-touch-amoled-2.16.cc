@@ -27,8 +27,12 @@
 #include <freertos/task.h>
 #include <lvgl.h>
 #include <array>
+#include <functional>
 #include <cstdio>
+#include <cstdlib>
+#include <memory>
 #include <string>
+#include <utility>
 
 #define TAG "WaveshareEsp32c6TouchAMOLED2inch16"
 
@@ -103,8 +107,251 @@ static const sh8601_lcd_init_cmd_t vendor_specific_init[] = {
 // 在waveshare_amoled_2_16类之前添加新的显示类
 class CustomLcdDisplay : public SpiLcdDisplay {
 private:
+    using ControlCallback = std::function<void(const std::string&, const std::string&,
+                                               const std::string&, const std::string&)>;
+    struct ActionContext {
+        CustomLcdDisplay* self = nullptr;
+        uint8_t room = 0;
+        uint8_t device = 0;
+        const char* action = nullptr;
+        const char* value = nullptr;
+    };
+
     lv_obj_t* dashboard_ = nullptr;
+    lv_obj_t* room_page_ = nullptr;
     std::array<lv_obj_t*, 4> room_labels_{};
+    std::array<ActionContext, 64> action_contexts_{};
+    size_t action_context_count_ = 0;
+    std::string latest_payload_;
+    ControlCallback control_callback_;
+    uint8_t selected_room_ = 0;
+
+    static constexpr const char* kRoomNames[] = {"主卧", "次卧", "客厅", "书房"};
+
+    ActionContext* NewContext(uint8_t room, uint8_t device, const char* action,
+                              const char* value = nullptr) {
+        if (action_context_count_ >= action_contexts_.size()) return nullptr;
+        auto& context = action_contexts_[action_context_count_++];
+        context = {this, room, device, action, value};
+        return &context;
+    }
+
+    static const cJSON* DeviceAt(const cJSON* room, size_t index) {
+        auto devices = cJSON_GetObjectItemCaseSensitive(room, "devices");
+        return cJSON_IsArray(devices) ? cJSON_GetArrayItem(devices, index) : nullptr;
+    }
+
+    static std::string DeviceIcon(const cJSON* device) {
+        auto type = cJSON_GetObjectItemCaseSensitive(device, "type");
+        if (!cJSON_IsString(type)) return LV_SYMBOL_POWER;
+        if (strcmp(type->valuestring, "climate") == 0) return LV_SYMBOL_SETTINGS;
+        if (strcmp(type->valuestring, "purifier") == 0) return LV_SYMBOL_LOOP;
+        if (strcmp(type->valuestring, "light") == 0) return LV_SYMBOL_BULLET;
+        return LV_SYMBOL_POWER;
+    }
+
+    static std::string CompactDevice(const cJSON* device) {
+        auto name = cJSON_GetObjectItemCaseSensitive(device, "name");
+        std::string text = DeviceIcon(device);
+        text += " ";
+        text += cJSON_IsString(name) ? name->valuestring : "设备";
+        text += StateText(device);
+        auto type = cJSON_GetObjectItemCaseSensitive(device, "type");
+        if (IsAvailable(device) && cJSON_IsString(type) &&
+            strcmp(type->valuestring, "climate") == 0 && strcmp(StateText(device), "关") != 0) {
+            auto temperature = cJSON_GetObjectItemCaseSensitive(device, "temperature");
+            if (cJSON_IsNumber(temperature)) {
+                char value[12];
+                snprintf(value, sizeof(value), "%.0f°", temperature->valuedouble);
+                text += value;
+            }
+        }
+        return text;
+    }
+
+    static std::string RoomOverview(const char* name, const cJSON* room) {
+        std::string text = name;
+        if (!cJSON_IsObject(room)) return text + "\n暂无设备";
+        auto temperature = cJSON_GetObjectItemCaseSensitive(room, "temperature");
+        auto humidity = cJSON_GetObjectItemCaseSensitive(room, "humidity");
+        if (cJSON_IsObject(temperature) && IsAvailable(temperature)) {
+            text += "  "; text += StateText(temperature); text += "°C";
+        }
+        if (cJSON_IsObject(humidity) && IsAvailable(humidity)) {
+            text += "  "; text += LV_SYMBOL_TINT; text += StateText(humidity); text += "%";
+        }
+        auto devices = cJSON_GetObjectItemCaseSensitive(room, "devices");
+        if (cJSON_IsArray(devices)) {
+            for (int i = 0; i < cJSON_GetArraySize(devices); ++i) {
+                if (i % 2 == 0) text += "\n"; else text += "  ";
+                text += CompactDevice(cJSON_GetArrayItem(devices, i));
+            }
+        }
+        return text;
+    }
+
+    lv_obj_t* MakeButton(lv_obj_t* parent, int x, int y, int w, int h, const char* text,
+                         ActionContext* context) {
+        auto button = lv_button_create(parent);
+        lv_obj_set_pos(button, x, y);
+        lv_obj_set_size(button, w, h);
+        lv_obj_set_style_radius(button, 10, 0);
+        auto label = lv_label_create(button);
+        lv_label_set_text(label, text);
+        lv_obj_center(label);
+        if (context != nullptr) {
+            lv_obj_add_event_cb(button, ActionEvent, LV_EVENT_CLICKED, context);
+        }
+        return button;
+    }
+
+    static void ActionEvent(lv_event_t* event) {
+        auto context = static_cast<ActionContext*>(lv_event_get_user_data(event));
+        if (context == nullptr || context->self == nullptr) return;
+        context->self->HandleAction(*context);
+    }
+
+    void HandleAction(const ActionContext& context) {
+        if (strcmp(context.action, "open_room") == 0) {
+            ShowRoom(context.room);
+            return;
+        }
+        if (strcmp(context.action, "overview") == 0) {
+            lv_obj_add_flag(room_page_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(dashboard_, LV_OBJ_FLAG_HIDDEN);
+            return;
+        }
+        if (strcmp(context.action, "room") == 0) {
+            ShowRoom(context.room);
+            return;
+        }
+
+        cJSON* root = cJSON_ParseWithLength(latest_payload_.data(), latest_payload_.size());
+        auto rooms = root ? cJSON_GetObjectItemCaseSensitive(root, "rooms") : nullptr;
+        auto room = cJSON_IsObject(rooms)
+                        ? cJSON_GetObjectItemCaseSensitive(rooms, kRoomNames[context.room]) : nullptr;
+        auto device = DeviceAt(room, context.device);
+        auto id = cJSON_GetObjectItemCaseSensitive(device, "id");
+        if (!cJSON_IsString(id)) {
+            cJSON_Delete(root);
+            return;
+        }
+        if (strcmp(context.action, "detail") == 0) {
+            ShowDeviceDetail(context.room, context.device);
+            cJSON_Delete(root);
+            return;
+        }
+        std::string device_id = id->valuestring;
+        std::string action = context.action;
+        std::string value = context.value ? context.value : "";
+        if (action == "toggle") {
+            auto state = cJSON_GetObjectItemCaseSensitive(device, "state");
+            bool on = cJSON_IsString(state) && strcmp(state->valuestring, "off") != 0 &&
+                      strcmp(state->valuestring, "unavailable") != 0 &&
+                      strcmp(state->valuestring, "unknown") != 0;
+            action = on ? "turn_off" : "turn_on";
+        } else if (action == "temperature_down" || action == "temperature_up") {
+            auto temperature = cJSON_GetObjectItemCaseSensitive(device, "temperature");
+            int target = cJSON_IsNumber(temperature) ? (int)temperature->valuedouble : 26;
+            target += action == "temperature_up" ? 1 : -1;
+            if (target < 16) target = 16;
+            if (target > 30) target = 30;
+            action = "set_temperature";
+            value = std::to_string(target);
+        }
+        cJSON_Delete(root);
+        if (control_callback_) control_callback_(kRoomNames[context.room], device_id, action, value);
+    }
+
+    void ShowRoom(uint8_t room_index) {
+        selected_room_ = room_index;
+        action_context_count_ = 4;  // Keep the four overview-card contexts stable.
+        lv_obj_clean(room_page_);
+        lv_obj_add_flag(dashboard_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(room_page_, LV_OBJ_FLAG_HIDDEN);
+        MakeButton(room_page_, 8, 6, 54, 42, LV_SYMBOL_LEFT,
+                   NewContext(room_index, 0, "overview"));
+        auto title = lv_label_create(room_page_);
+        lv_label_set_text(title, kRoomNames[room_index]);
+        lv_obj_set_pos(title, 76, 14);
+
+        cJSON* root = cJSON_ParseWithLength(latest_payload_.data(), latest_payload_.size());
+        auto rooms = root ? cJSON_GetObjectItemCaseSensitive(root, "rooms") : nullptr;
+        auto room = cJSON_IsObject(rooms)
+                        ? cJSON_GetObjectItemCaseSensitive(rooms, kRoomNames[room_index]) : nullptr;
+        auto devices = cJSON_GetObjectItemCaseSensitive(room, "devices");
+        if (cJSON_IsArray(devices)) {
+            int count = cJSON_GetArraySize(devices);
+            for (int i = 0; i < count && i < 4; ++i) {
+                auto device = cJSON_GetArrayItem(devices, i);
+                auto row = lv_obj_create(room_page_);
+                lv_obj_set_pos(row, 8, 56 + i * 72);
+                lv_obj_set_size(row, 428, 64);
+                lv_obj_set_style_pad_all(row, 7, 0);
+                lv_obj_set_style_radius(row, 12, 0);
+                lv_obj_set_scrollbar_mode(row, LV_SCROLLBAR_MODE_OFF);
+                auto label = lv_label_create(row);
+                auto name = cJSON_GetObjectItemCaseSensitive(device, "name");
+                lv_label_set_text_fmt(label, "%s %s  %s", DeviceIcon(device).c_str(),
+                                      cJSON_IsString(name) ? name->valuestring : "设备", StateText(device));
+                lv_obj_set_pos(label, 4, 13);
+                MakeButton(row, 282, 4, 58, 44, LV_SYMBOL_POWER,
+                           NewContext(room_index, i, "toggle"));
+                auto type = cJSON_GetObjectItemCaseSensitive(device, "type");
+                if (cJSON_IsString(type) &&
+                    (strcmp(type->valuestring, "climate") == 0 ||
+                     strcmp(type->valuestring, "purifier") == 0)) {
+                    MakeButton(row, 348, 4, 58, 44, LV_SYMBOL_SETTINGS,
+                               NewContext(room_index, i, "detail"));
+                }
+            }
+        }
+        cJSON_Delete(root);
+    }
+
+    void ShowDeviceDetail(uint8_t room_index, uint8_t device_index) {
+        action_context_count_ = 4;
+        lv_obj_clean(room_page_);
+        MakeButton(room_page_, 8, 6, 54, 42, LV_SYMBOL_LEFT,
+                   NewContext(room_index, 0, "room"));
+        cJSON* root = cJSON_ParseWithLength(latest_payload_.data(), latest_payload_.size());
+        auto rooms = root ? cJSON_GetObjectItemCaseSensitive(root, "rooms") : nullptr;
+        auto room = cJSON_IsObject(rooms)
+                        ? cJSON_GetObjectItemCaseSensitive(rooms, kRoomNames[room_index]) : nullptr;
+        auto device = DeviceAt(room, device_index);
+        auto name = cJSON_GetObjectItemCaseSensitive(device, "name");
+        auto type = cJSON_GetObjectItemCaseSensitive(device, "type");
+        auto title = lv_label_create(room_page_);
+        lv_label_set_text_fmt(title, "%s · %s", kRoomNames[room_index],
+                              cJSON_IsString(name) ? name->valuestring : "设备");
+        lv_obj_set_pos(title, 76, 14);
+        MakeButton(room_page_, 350, 6, 78, 42, LV_SYMBOL_POWER,
+                   NewContext(room_index, device_index, "toggle"));
+        if (cJSON_IsString(type) && strcmp(type->valuestring, "climate") == 0) {
+            auto temperature = cJSON_GetObjectItemCaseSensitive(device, "temperature");
+            auto temp = lv_label_create(room_page_);
+            lv_label_set_text_fmt(temp, "设定温度  %.0f°C", cJSON_IsNumber(temperature) ? temperature->valuedouble : 26);
+            lv_obj_set_pos(temp, 140, 70);
+            MakeButton(room_page_, 50, 60, 60, 46, LV_SYMBOL_MINUS,
+                       NewContext(room_index, device_index, "temperature_down"));
+            MakeButton(room_page_, 330, 60, 60, 46, LV_SYMBOL_PLUS,
+                       NewContext(room_index, device_index, "temperature_up"));
+            const char* modes[][2] = {{"制冷", "cool"}, {"制热", "heat"}, {"自动", "auto"}};
+            for (int i = 0; i < 3; ++i) MakeButton(room_page_, 28 + i * 136, 124, 118, 44, modes[i][0],
+                NewContext(room_index, device_index, "set_hvac_mode", modes[i][1]));
+            const char* fans[][2] = {{"低风", "low"}, {"中风", "medium"}, {"高风", "high"}, {"自动风", "auto"}};
+            for (int i = 0; i < 4; ++i) MakeButton(room_page_, 12 + i * 106, 184, 96, 44, fans[i][0],
+                NewContext(room_index, device_index, "set_fan_mode", fans[i][1]));
+            const char* swings[][2] = {{"关摆风", "off"}, {"上下", "vertical"}, {"左右", "horizontal"}, {"全向", "both"}};
+            for (int i = 0; i < 4; ++i) MakeButton(room_page_, 12 + i * 106, 244, 96, 44, swings[i][0],
+                NewContext(room_index, device_index, "set_swing", swings[i][1]));
+        } else {
+            const char* presets[][2] = {{"自动", "自动"}, {"睡眠", "睡眠"}, {"最爱", "最爱"}};
+            for (int i = 0; i < 3; ++i) MakeButton(room_page_, 28 + i * 136, 90, 118, 50, presets[i][0],
+                NewContext(room_index, device_index, "set_preset_mode", presets[i][1]));
+        }
+        cJSON_Delete(root);
+    }
 
     static const char* StateText(const cJSON* item) {
         auto state = cJSON_GetObjectItemCaseSensitive(item, "state");
@@ -220,7 +467,6 @@ private:
         lv_obj_set_style_pad_all(dashboard_, 0, 0);
         lv_obj_set_scrollbar_mode(dashboard_, LV_SCROLLBAR_MODE_OFF);
 
-        constexpr const char* names[] = {"主卧", "次卧", "客厅", "书房"};
         for (size_t i = 0; i < room_labels_.size(); ++i) {
             auto card = lv_obj_create(dashboard_);
             lv_obj_set_size(card, 214, 170);
@@ -229,14 +475,26 @@ private:
             lv_obj_set_style_bg_color(card, lv_color_hex(0x152235), 0);
             lv_obj_set_style_border_color(card, lv_color_hex(0x294461), 0);
             lv_obj_set_style_border_width(card, 1, 0);
-            lv_obj_set_style_pad_all(card, 14, 0);
+            lv_obj_set_style_pad_all(card, 10, 0);
             lv_obj_set_scrollbar_mode(card, LV_SCROLLBAR_MODE_OFF);
+            lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(card, ActionEvent, LV_EVENT_CLICKED,
+                                NewContext(i, 0, "open_room"));
             room_labels_[i] = lv_label_create(card);
             lv_obj_set_width(room_labels_[i], 186);
             lv_label_set_long_mode(room_labels_[i], LV_LABEL_LONG_WRAP);
             lv_obj_set_style_text_color(room_labels_[i], lv_color_hex(0xEAF4FF), 0);
-            lv_label_set_text_fmt(room_labels_[i], "%s\n等待网关…", names[i]);
+            lv_label_set_text_fmt(room_labels_[i], "%s\n等待网关…", kRoomNames[i]);
         }
+        room_page_ = lv_obj_create(screen);
+        lv_obj_set_size(room_page_, 444, 360);
+        lv_obj_align(room_page_, LV_ALIGN_CENTER, 0, 8);
+        lv_obj_set_style_bg_color(room_page_, lv_color_hex(0x080D16), 0);
+        lv_obj_set_style_bg_opa(room_page_, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(room_page_, 0, 0);
+        lv_obj_set_style_pad_all(room_page_, 0, 0);
+        lv_obj_set_scrollbar_mode(room_page_, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_add_flag(room_page_, LV_OBJ_FLAG_HIDDEN);
         if (emoji_box_ != nullptr) {
             lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
         }
@@ -261,9 +519,9 @@ public:
 
     CustomLcdDisplay(esp_lcd_panel_io_handle_t io_handle, esp_lcd_panel_handle_t panel_handle,
                      int width, int height, int offset_x, int offset_y, bool mirror_x,
-                     bool mirror_y, bool swap_xy)
+                     bool mirror_y, bool swap_xy, ControlCallback control_callback)
         : SpiLcdDisplay(io_handle, panel_handle, width, height, offset_x, offset_y, mirror_x,
-                        mirror_y, swap_xy) {}
+                        mirror_y, swap_xy), control_callback_(std::move(control_callback)) {}
 
     virtual void SetupUI() override {
         // Call parent SetupUI() first to create all lvgl objects
@@ -283,20 +541,12 @@ public:
             return;
         }
         auto rooms = cJSON_GetObjectItemCaseSensitive(root, "rooms");
-        constexpr const char* names[] = {"主卧", "次卧", "客厅", "书房"};
         DisplayLockGuard lock(this);
+        latest_payload_ = payload;
         if (cJSON_IsObject(rooms) && dashboard_ != nullptr) {
             for (size_t i = 0; i < room_labels_.size(); ++i) {
-                auto room = cJSON_GetObjectItemCaseSensitive(rooms, names[i]);
-                std::string text = names[i];
-                if (!cJSON_IsObject(room)) {
-                    text += "\n暂无设备";
-                } else {
-                    AppendLight(text, room);
-                    AppendClimate(text, room);
-                    AppendRole(text, room, "temperature", "温度  ", "°C");
-                    AppendRole(text, room, "humidity", "湿度  ", "%");
-                }
+                auto room = cJSON_GetObjectItemCaseSensitive(rooms, kRoomNames[i]);
+                std::string text = RoomOverview(kRoomNames[i], room);
                 lv_label_set_text(room_labels_[i], text.c_str());
             }
         }
@@ -325,12 +575,76 @@ protected:
 
 class WaveshareEsp32c6TouchAMOLED2inch16 : public WifiBoard {
 private:
+    struct HaControlRequest {
+        WaveshareEsp32c6TouchAMOLED2inch16* self;
+        std::string room;
+        std::string device;
+        std::string action;
+        std::string value;
+    };
     i2c_master_bus_handle_t i2c_bus_;
     Pmic* pmic_ = nullptr;
     Button boot_button_;
     CustomLcdDisplay* display_;
     CustomBacklight* backlight_;
     PowerSaveTimer* power_save_timer_;
+
+    void FetchHaDisplayOnce(const std::string& display_url) {
+        auto network = GetNetwork();
+        if (network == nullptr) return;
+        auto http = network->CreateHttp(0);
+        http->SetTimeout(5000);
+        if (http->Open("GET", display_url) && http->GetStatusCode() == 200) {
+            display_->UpdateDashboard(http->ReadAll());
+        } else {
+            ESP_LOGW(TAG, "HA display gateway unavailable");
+        }
+        http->Close();
+    }
+
+    void QueueHaControl(const std::string& room, const std::string& device,
+                        const std::string& action, const std::string& value) {
+        auto request = new HaControlRequest{this, room, device, action, value};
+        xTaskCreate(
+            [](void* arg) {
+                std::unique_ptr<HaControlRequest> request(static_cast<HaControlRequest*>(arg));
+                Settings settings("wifi", false);
+                auto control_url = settings.GetString("ha_control_url", HA_CONTROL_URL);
+                auto display_url = settings.GetString("ha_display_url", HA_DISPLAY_URL);
+                cJSON* payload = cJSON_CreateObject();
+                cJSON_AddStringToObject(payload, "room", request->room.c_str());
+                cJSON_AddStringToObject(payload, "device", request->device.c_str());
+                cJSON_AddStringToObject(payload, "action", request->action.c_str());
+                if (!request->value.empty()) {
+                    char* end = nullptr;
+                    double number = strtod(request->value.c_str(), &end);
+                    if (end != request->value.c_str() && *end == '\0') {
+                        cJSON_AddNumberToObject(payload, "value", number);
+                    } else {
+                        cJSON_AddStringToObject(payload, "value", request->value.c_str());
+                    }
+                }
+                char* json = cJSON_PrintUnformatted(payload);
+                cJSON_Delete(payload);
+                auto network = request->self->GetNetwork();
+                if (network != nullptr && json != nullptr) {
+                    auto http = network->CreateHttp(0);
+                    http->SetTimeout(5000);
+                    http->SetHeader("Content-Type", "application/json");
+                    http->SetContent(std::string(json));
+                    if (!http->Open("POST", control_url) || http->GetStatusCode() != 200) {
+                        ESP_LOGW(TAG, "HA touch control failed: %d", http->GetStatusCode());
+                    } else {
+                        vTaskDelay(pdMS_TO_TICKS(300));
+                        request->self->FetchHaDisplayOnce(display_url);
+                    }
+                    http->Close();
+                }
+                cJSON_free(json);
+                vTaskDelete(nullptr);
+            },
+            "ha_control", 6144, request, 3, nullptr);
+    }
 
     void StartHaDisplayTask() {
         xTaskCreate(
@@ -343,15 +657,7 @@ private:
                 while (true) {
                     auto network = self->GetNetwork();
                     if (network != nullptr) {
-                        auto http = network->CreateHttp(0);
-                        http->SetTimeout(5000);
-                        if (http->Open("GET", display_url) && http->GetStatusCode() == 200) {
-                            auto body = http->ReadAll();
-                            self->display_->UpdateDashboard(body);
-                        } else {
-                            ESP_LOGW(TAG, "HA display gateway unavailable");
-                        }
-                        http->Close();
+                        self->FetchHaDisplayOnce(display_url);
                     }
                     vTaskDelay(pdMS_TO_TICKS(HA_DISPLAY_REFRESH_SECONDS * 1000));
                 }
@@ -461,7 +767,11 @@ private:
         ESP_ERROR_CHECK(esp_lcd_panel_init(panel));
         display_ = new CustomLcdDisplay(panel_io, panel, LCD_H_RES, LCD_V_RES, DISPLAY_OFFSET_X,
                                         DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y,
-                                        DISPLAY_SWAP_XY);
+                                        DISPLAY_SWAP_XY,
+                                        [this](const std::string& room, const std::string& device,
+                                               const std::string& action, const std::string& value) {
+                                            QueueHaControl(room, device, action, value);
+                                        });
         backlight_ = new CustomBacklight(panel_io);
         backlight_->RestoreBrightness();
     }
