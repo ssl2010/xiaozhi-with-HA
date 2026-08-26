@@ -119,7 +119,8 @@ private:
 
     lv_obj_t* dashboard_ = nullptr;
     lv_obj_t* room_page_ = nullptr;
-    std::array<lv_obj_t*, 4> room_labels_{};
+    std::array<lv_obj_t*, 4> room_sensor_labels_{};
+    std::array<std::array<lv_obj_t*, 4>, 4> room_device_labels_{};
     std::array<ActionContext, 64> action_contexts_{};
     size_t action_context_count_ = 0;
     std::string latest_payload_;
@@ -167,25 +168,40 @@ private:
         return text;
     }
 
-    static std::string RoomOverview(const char* name, const cJSON* room) {
-        std::string text = name;
-        if (!cJSON_IsObject(room)) return text + "\n暂无设备";
+    static std::string RoomSensors(const cJSON* room) {
+        std::string text;
+        if (!cJSON_IsObject(room)) return text;
         auto temperature = cJSON_GetObjectItemCaseSensitive(room, "temperature");
         auto humidity = cJSON_GetObjectItemCaseSensitive(room, "humidity");
         if (cJSON_IsObject(temperature) && IsAvailable(temperature)) {
-            text += "  "; text += StateText(temperature); text += "°C";
+            text += StateText(temperature); text += "°";
         }
         if (cJSON_IsObject(humidity) && IsAvailable(humidity)) {
-            text += "  "; text += LV_SYMBOL_TINT; text += StateText(humidity); text += "%";
-        }
-        auto devices = cJSON_GetObjectItemCaseSensitive(room, "devices");
-        if (cJSON_IsArray(devices)) {
-            for (int i = 0; i < cJSON_GetArraySize(devices); ++i) {
-                if (i % 2 == 0) text += "\n"; else text += "  ";
-                text += CompactDevice(cJSON_GetArrayItem(devices, i));
-            }
+            if (!text.empty()) text += "  ";
+            text += LV_SYMBOL_TINT; text += StateText(humidity); text += "%";
         }
         return text;
+    }
+
+    static bool IsOn(const cJSON* device) {
+        auto state = cJSON_GetObjectItemCaseSensitive(device, "state");
+        return cJSON_IsString(state) && strcmp(state->valuestring, "off") != 0 &&
+               strcmp(state->valuestring, "unavailable") != 0 &&
+               strcmp(state->valuestring, "unknown") != 0;
+    }
+
+    static lv_color_t StateColor(const cJSON* device) {
+        if (!IsAvailable(device)) return lv_color_hex(0x667080);
+        return IsOn(device) ? lv_color_hex(0x41B8FF) : lv_color_hex(0xAAB4C0);
+    }
+
+    static void StylePowerButton(lv_obj_t* button, const cJSON* device) {
+        bool available = IsAvailable(device);
+        lv_obj_set_style_bg_color(button,
+            available && IsOn(device) ? lv_color_hex(0x0877B9) : lv_color_hex(0x263646), 0);
+        lv_obj_set_style_text_color(button,
+            available ? lv_color_hex(0xFFFFFF) : lv_color_hex(0x77818C), 0);
+        if (!available) lv_obj_remove_flag(button, LV_OBJ_FLAG_CLICKABLE);
     }
 
     lv_obj_t* MakeButton(lv_obj_t* parent, int x, int y, int w, int h, const char* text,
@@ -194,6 +210,7 @@ private:
         lv_obj_set_pos(button, x, y);
         lv_obj_set_size(button, w, h);
         lv_obj_set_style_radius(button, 10, 0);
+        lv_obj_remove_flag(button, LV_OBJ_FLAG_SCROLLABLE);
         auto label = lv_label_create(button);
         lv_label_set_text(label, text);
         lv_obj_center(label);
@@ -265,6 +282,7 @@ private:
         selected_room_ = room_index;
         action_context_count_ = 4;  // Keep the four overview-card contexts stable.
         lv_obj_clean(room_page_);
+        lv_obj_remove_flag(room_page_, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(dashboard_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(room_page_, LV_OBJ_FLAG_HIDDEN);
         MakeButton(room_page_, 8, 6, 54, 42, LV_SYMBOL_LEFT,
@@ -288,13 +306,15 @@ private:
                 lv_obj_set_style_pad_all(row, 7, 0);
                 lv_obj_set_style_radius(row, 12, 0);
                 lv_obj_set_scrollbar_mode(row, LV_SCROLLBAR_MODE_OFF);
+                lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
                 auto label = lv_label_create(row);
                 auto name = cJSON_GetObjectItemCaseSensitive(device, "name");
                 lv_label_set_text_fmt(label, "%s %s  %s", DeviceIcon(device).c_str(),
                                       cJSON_IsString(name) ? name->valuestring : "设备", StateText(device));
                 lv_obj_set_pos(label, 4, 13);
-                MakeButton(row, 282, 4, 58, 44, LV_SYMBOL_POWER,
-                           NewContext(room_index, i, "toggle"));
+                auto power = MakeButton(row, 282, 4, 58, 44, LV_SYMBOL_POWER,
+                                        NewContext(room_index, i, "toggle"));
+                StylePowerButton(power, device);
                 auto type = cJSON_GetObjectItemCaseSensitive(device, "type");
                 if (cJSON_IsString(type) &&
                     (strcmp(type->valuestring, "climate") == 0 ||
@@ -323,8 +343,9 @@ private:
         lv_label_set_text_fmt(title, "%s · %s", kRoomNames[room_index],
                               cJSON_IsString(name) ? name->valuestring : "设备");
         lv_obj_set_pos(title, 76, 14);
-        MakeButton(room_page_, 350, 6, 78, 42, LV_SYMBOL_POWER,
-                   NewContext(room_index, device_index, "toggle"));
+        auto power = MakeButton(room_page_, 350, 6, 78, 42, LV_SYMBOL_POWER,
+                                NewContext(room_index, device_index, "toggle"));
+        StylePowerButton(power, device);
         if (cJSON_IsString(type) && strcmp(type->valuestring, "climate") == 0) {
             auto temperature = cJSON_GetObjectItemCaseSensitive(device, "temperature");
             auto temp = lv_label_create(room_page_);
@@ -464,8 +485,9 @@ private:
         lv_obj_set_style_border_width(dashboard_, 0, 0);
         lv_obj_set_style_pad_all(dashboard_, 0, 0);
         lv_obj_set_scrollbar_mode(dashboard_, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_remove_flag(dashboard_, LV_OBJ_FLAG_SCROLLABLE);
 
-        for (size_t i = 0; i < room_labels_.size(); ++i) {
+        for (size_t i = 0; i < room_sensor_labels_.size(); ++i) {
             auto card = lv_obj_create(dashboard_);
             lv_obj_set_size(card, 214, 170);
             lv_obj_set_pos(card, (i % 2) * 224 + 3, (i / 2) * 180 + 3);
@@ -475,14 +497,29 @@ private:
             lv_obj_set_style_border_width(card, 1, 0);
             lv_obj_set_style_pad_all(card, 10, 0);
             lv_obj_set_scrollbar_mode(card, LV_SCROLLBAR_MODE_OFF);
+            lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
             lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
             lv_obj_add_event_cb(card, ActionEvent, LV_EVENT_CLICKED,
                                 NewContext(i, 0, "open_room"));
-            room_labels_[i] = lv_label_create(card);
-            lv_obj_set_width(room_labels_[i], 186);
-            lv_label_set_long_mode(room_labels_[i], LV_LABEL_LONG_WRAP);
-            lv_obj_set_style_text_color(room_labels_[i], lv_color_hex(0xEAF4FF), 0);
-            lv_label_set_text_fmt(room_labels_[i], "%s\n等待网关…", kRoomNames[i]);
+            auto title = lv_label_create(card);
+            lv_label_set_text(title, kRoomNames[i]);
+            lv_obj_set_pos(title, 2, 0);
+            lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+            room_sensor_labels_[i] = lv_label_create(card);
+            lv_obj_set_pos(room_sensor_labels_[i], 2, 30);
+            lv_obj_set_width(room_sensor_labels_[i], 192);
+            lv_label_set_long_mode(room_sensor_labels_[i], LV_LABEL_LONG_CLIP);
+            lv_label_set_text(room_sensor_labels_[i], "等待网关…");
+            lv_obj_set_style_text_color(room_sensor_labels_[i], lv_color_hex(0x91A8BE), 0);
+            for (size_t j = 0; j < room_device_labels_[i].size(); ++j) {
+                auto slot = lv_label_create(card);
+                lv_obj_set_pos(slot, 2 + (j % 2) * 98, 64 + (j / 2) * 43);
+                lv_obj_set_size(slot, 94, 36);
+                lv_label_set_long_mode(slot, LV_LABEL_LONG_CLIP);
+                lv_label_set_text(slot, "");
+                lv_obj_add_flag(slot, LV_OBJ_FLAG_HIDDEN);
+                room_device_labels_[i][j] = slot;
+            }
         }
         room_page_ = lv_obj_create(screen);
         lv_obj_set_size(room_page_, 444, 360);
@@ -492,6 +529,7 @@ private:
         lv_obj_set_style_border_width(room_page_, 0, 0);
         lv_obj_set_style_pad_all(room_page_, 0, 0);
         lv_obj_set_scrollbar_mode(room_page_, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_remove_flag(room_page_, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(room_page_, LV_OBJ_FLAG_HIDDEN);
         if (emoji_box_ != nullptr) {
             lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
@@ -542,10 +580,24 @@ public:
         DisplayLockGuard lock(this);
         latest_payload_ = payload;
         if (cJSON_IsObject(rooms) && dashboard_ != nullptr) {
-            for (size_t i = 0; i < room_labels_.size(); ++i) {
+            for (size_t i = 0; i < room_sensor_labels_.size(); ++i) {
                 auto room = cJSON_GetObjectItemCaseSensitive(rooms, kRoomNames[i]);
-                std::string text = RoomOverview(kRoomNames[i], room);
-                lv_label_set_text(room_labels_[i], text.c_str());
+                std::string sensors = RoomSensors(room);
+                lv_label_set_text(room_sensor_labels_[i], sensors.empty() ? "暂无环境数据" : sensors.c_str());
+                auto devices = cJSON_GetObjectItemCaseSensitive(room, "devices");
+                int count = cJSON_IsArray(devices) ? cJSON_GetArraySize(devices) : 0;
+                for (size_t j = 0; j < room_device_labels_[i].size(); ++j) {
+                    auto label = room_device_labels_[i][j];
+                    if ((int)j >= count) {
+                        lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
+                        continue;
+                    }
+                    auto device = cJSON_GetArrayItem(devices, j);
+                    std::string text = CompactDevice(device);
+                    lv_label_set_text(label, text.c_str());
+                    lv_obj_set_style_text_color(label, StateColor(device), 0);
+                    lv_obj_clear_flag(label, LV_OBJ_FLAG_HIDDEN);
+                }
             }
         }
         cJSON_Delete(root);
