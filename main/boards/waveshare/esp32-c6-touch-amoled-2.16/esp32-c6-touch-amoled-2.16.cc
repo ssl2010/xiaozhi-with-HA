@@ -151,10 +151,8 @@ private:
     }
 
     static std::string CompactDevice(const cJSON* device) {
-        auto name = cJSON_GetObjectItemCaseSensitive(device, "name");
         std::string text = DeviceIcon(device);
         text += " ";
-        text += cJSON_IsString(name) ? name->valuestring : "设备";
         text += StateText(device);
         auto type = cJSON_GetObjectItemCaseSensitive(device, "type");
         if (IsAvailable(device) && cJSON_IsString(type) &&
